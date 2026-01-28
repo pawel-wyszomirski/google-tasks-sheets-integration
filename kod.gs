@@ -1,10 +1,11 @@
 /**
  * Skrypt zarządzający listą zadań "plan" oraz synchronizacją z Arkuszem.
  * 
- * NOWE FUNKCJE:
+ * FUNKCJE:
  * - [!] w tytule = pilne (przenosi na górę listy)
  * - [30m], [2h] w tytule = time tracking (arkusz sumuje czas)
  * - [+3] w notatkach = przesuwa termin o 3 dni
+ * - 📅 Pobieranie wydarzeń z Google Calendar do listy "plan"
  * 
  * INSTRUKCJA INSTALACJI:
  * 1. Otwórz Arkusz Google -> Rozszerzenia -> Apps Script.
@@ -214,7 +215,7 @@ function zarzadzajPlanemDnia() {
 }
 
 // ============================================
-// NOWA FUNKCJA: OBSŁUGA [+X] - PRZESUWANIE DAT
+// FUNKCJA: OBSŁUGA [+X] - PRZESUWANIE DAT
 // ============================================
 
 function obslugujPrzesuniecia() {
@@ -270,7 +271,7 @@ function obslugujPrzesuniecia() {
 }
 
 // ============================================
-// NOWA FUNKCJA: OBSŁUGA [!] - PILNE NA GÓRĘ
+// FUNKCJA: OBSŁUGA [!] - PILNE NA GÓRĘ
 // ============================================
 
 function obslugujPilne() {
@@ -326,6 +327,182 @@ function obslugujPilne() {
 }
 
 // ============================================
+// POBIERANIE WYDARZEŃ Z KALENDARZA DO LISTY "PLAN"
+// ============================================
+
+/**
+ * Pobiera DZISIEJSZE wydarzenia z kalendarza "gmail.com" i tworzy z nich zadania w "plan"
+ * Zadania NIE mają daty (więc nie duplikują się w widoku kalendarza)
+ * Godzina jest w tytule, link do wydarzenia w notatkach
+ */
+function pobierzWydarzeniaDoPlanu() {
+  const LISTA_DOCELOWA = "plan";
+  const NAZWA_KALENDARZA = "gmail.com"; // ZMIEŃ TUTAJ jeśli nazwa kalendarza jest inna
+  
+  const wszystkieListy = Tasks.Tasklists.list().items;
+  if (!wszystkieListy) return;
+
+  let listaDocelowa = wszystkieListy.find(l => l.title.toLowerCase() === LISTA_DOCELOWA.toLowerCase());
+  
+  if (!listaDocelowa) {
+    listaDocelowa = Tasks.Tasklists.insert({title: LISTA_DOCELOWA});
+    Logger.log("Utworzono nową listę: " + LISTA_DOCELOWA);
+  }
+
+  // ZNAJDŹ KALENDARZ PO NAZWIE
+  const wszystkieKalendarze = CalendarApp.getAllCalendars();
+  const calendar = wszystkieKalendarze.find(cal => cal.getName().includes(NAZWA_KALENDARZA));
+  
+  if (!calendar) {
+    try {
+      SpreadsheetApp.getUi().alert(`❌ Nie znaleziono kalendarza "${NAZWA_KALENDARZA}"!\n\nDostępne kalendarze:\n${wszystkieKalendarze.map(c => "- " + c.getName()).join("\n")}`);
+    } catch(e) {
+      Logger.log(`BŁĄD: Nie znaleziono kalendarza "${NAZWA_KALENDARZA}"`);
+    }
+    return;
+  }
+  
+  Logger.log(`✓ Znaleziono kalendarz: ${calendar.getName()}`);
+  
+  // TYLKO DZISIAJ (żeby trafiły do planu)
+  const dzisiaj = new Date();
+  dzisiaj.setHours(0, 0, 0, 0);
+  
+  const jutro = new Date(dzisiaj);
+  jutro.setDate(jutro.getDate() + 1);
+  
+  // Pobierz wydarzenia
+  const wydarzenia = calendar.getEvents(dzisiaj, jutro);
+  
+  // Pobierz istniejące zadania z listy "plan"
+  const istniejaceZadania = Tasks.Tasks.list(listaDocelowa.id, { showCompleted: false }).items || [];
+  
+  // Zbuduj mapę istniejących wydarzeń kalendarzowych (po CalendarID)
+  const istniejaceWydarzeniaMap = {};
+  istniejaceZadania.forEach(zadanie => {
+    const match = zadanie.notes?.match(/\[CalendarID:(.+?)\]/);
+    if (match) {
+      istniejaceWydarzeniaMap[match[1]] = zadanie;
+    }
+  });
+  
+  let licznikDodanych = 0;
+  let licznikPominiętych = 0;
+
+  wydarzenia.forEach(wydarzenie => {
+    const eventId = wydarzenie.getId();
+    
+    // Sprawdź czy to wydarzenie już istnieje jako zadanie
+    if (istniejaceWydarzeniaMap[eventId]) {
+      licznikPominiętych++;
+      return; // Pomiń - już istnieje
+    }
+    
+    // Przygotuj dane zadania
+    const start = wydarzenie.getStartTime();
+    const end = wydarzenie.getEndTime();
+    const czasTrwania = Math.round((end - start) / (1000 * 60)); // minuty
+    
+    // Tytuł z godziną
+    const godzina = Utilities.formatDate(start, Session.getScriptTimeZone(), "HH:mm");
+    const tytul = `🕐 ${godzina} ${wydarzenie.getTitle()}`;
+    
+    // Link do wydarzenia w Google Calendar
+    const linkDoWydarzenia = `https://calendar.google.com/calendar/event?eid=${encodeURIComponent(eventId.replace('@google.com', ''))}`;
+    
+    // Notatki z linkiem, lokalizacją i czasem
+    let notatki = `🔗 ${linkDoWydarzenia}\n\n`;
+    
+    if (wydarzenie.getLocation()) {
+      notatki += "📍 " + wydarzenie.getLocation() + "\n";
+    }
+    
+    notatki += `⏱️ ${formatujCzas(czasTrwania)}\n`;
+    
+    if (wydarzenie.getDescription()) {
+      notatki += "\n" + wydarzenie.getDescription() + "\n";
+    }
+    
+    notatki += `\n_______\n[CalendarID:${eventId}]`;
+    
+    const noweZadanie = {
+      title: tytul,
+      notes: notatki
+      // BRAK POLA "due" - dzięki temu nie pokazuje się w kalendarzu!
+    };
+
+    try {
+      Tasks.Tasks.insert(noweZadanie, listaDocelowa.id);
+      licznikDodanych++;
+      Logger.log(`✓ Dodano wydarzenie: ${wydarzenie.getTitle()} o ${godzina}`);
+    } catch (e) {
+      Logger.log(`✗ Błąd dodawania wydarzenia: ${e.message}`);
+    }
+  });
+  
+  try {
+    SpreadsheetApp.getUi().alert(
+      `Pobrano wydarzenia z kalendarza "${calendar.getName()}"!\n\n` +
+      `✅ Dodano: ${licznikDodanych} wydarzeń\n` +
+      `⏭️ Pominięto: ${licznikPominiętych} (już istnieją)\n\n` +
+      `💡 Zadania NIE mają daty, więc nie duplikują się w kalendarzu!`
+    );
+  } catch(e) {
+    Logger.log(`Dodano ${licznikDodanych} wydarzeń, pominięto ${licznikPominiętych}`);
+  }
+}
+
+/**
+ * Usuwa zadania pochodzące z kalendarza (mające CalendarID)
+ */
+function usunWydarzeniaZPlanu() {
+  const LISTA_DOCELOWA = "plan";
+  
+  const wszystkieListy = Tasks.Tasklists.list().items;
+  if (!wszystkieListy) return;
+  
+  const listaDocelowa = wszystkieListy.find(l => l.title.toLowerCase() === LISTA_DOCELOWA.toLowerCase());
+  if (!listaDocelowa) return;
+  
+  const zadania = Tasks.Tasks.list(listaDocelowa.id, { showCompleted: false }).items || [];
+  
+  let licznikUsuniętych = 0;
+
+  zadania.forEach(zadanie => {
+    // Sprawdź czy zadanie pochodzi z kalendarza (ma CalendarID)
+    if (zadanie.notes?.includes('[CalendarID:')) {
+      try {
+        Tasks.Tasks.remove(listaDocelowa.id, zadanie.id);
+        licznikUsuniętych++;
+        Logger.log(`Usunięto: ${zadanie.title}`);
+      } catch (e) {
+        Logger.log(`Błąd usuwania: ${e.message}`);
+      }
+    }
+  });
+  
+  try {
+    SpreadsheetApp.getUi().alert(`Usunięto ${licznikUsuniętych} wydarzeń kalendarzowych z listy "plan"`);
+  } catch(e) {
+    Logger.log(`Usunięto ${licznikUsuniętych} wydarzeń`);
+  }
+}
+
+/**
+ * Wyświetla listę wszystkich kalendarzy
+ */
+function pokazKalendarze() {
+  const kalendarze = CalendarApp.getAllCalendars();
+  const lista = kalendarze.map(cal => `- ${cal.getName()}`).join("\n");
+  
+  try {
+    SpreadsheetApp.getUi().alert(`Twoje kalendarze:\n\n${lista}\n\n💡 Zmień nazwę w linii 420 kodu (NAZWA_KALENDARZA)`);
+  } catch(e) {
+    Logger.log(`Kalendarze:\n${lista}`);
+  }
+}
+
+// ============================================
 // MENU I AUTOMATYZACJA
 // ============================================
 
@@ -338,6 +515,10 @@ function onOpen() {
     ui.createMenu('🔄 Sync Tasks')
         .addItem('Pobierz zadania do Arkusza', 'synchronizujZadaniaDoArkusza')
         .addItem('Wyślij zmiany z Arkusza do Google Tasks', 'synchronizujZArkuszaDoZadan')
+        .addSeparator()
+        .addItem('📅 Pobierz DZISIEJSZE wydarzenia do planu', 'pobierzWydarzeniaDoPlanu')
+        .addItem('🗑️ Usuń wydarzenia kalendarzowe z planu', 'usunWydarzeniaZPlanu')
+        .addItem('📋 Pokaż moje kalendarze', 'pokazKalendarze')
         .addSeparator()
         .addItem('📅 Uruchom Plan Dnia', 'zarzadzajPlanemDnia')
         .addItem('⏭️ Przesuń zadania z [+X]', 'obslugujPrzesuniecia')
@@ -610,7 +791,7 @@ function synchronizujZArkuszaDoZadan() {
 }
 
 // ============================================
-// NOWA FUNKCJA: ANALIZA CZASU
+// ANALIZA CZASU
 // ============================================
 
 /**
